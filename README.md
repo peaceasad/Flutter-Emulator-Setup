@@ -128,26 +128,39 @@ Expected: `10.0.2.2:4444`
 ---
 
 ## 7. Install the Burp CA as a System CA
-
+ 
 System-level CA installation is required for the proxy to be *trusted*, not just reached. Browser traffic alone being decrypted does not confirm the app will trust the same cert — see §8.
-
+ 
 ### 7.1 Export and Verify the Burp CA
 Burp → Proxy → Proxy settings → Import/Export CA certificate → export as DER.
-
+ 
 ```
 openssl x509 -inform DER -in burpca.der -subject -issuer -noout
 ```
 Expected: `O=PortSwigger ... CN=PortSwigger CA` on both lines.
-
-### 7.2 Compute the Android Hash Filename
-
+ 
+### 7.2 Convert DER → CRT (PEM)
+ 
+Compute the Android hash filename from a PEM-format certificate, not directly from the raw DER file — doing it directly from DER is unreliable across OpenSSL versions/builds. Convert first:
+ 
 ```
-openssl x509 -inform DER -subject_hash_old -in burpca.der -noout
+openssl x509 -inform DER -in burpca.der -out burpca.crt
+```
+ 
+### 7.3 Compute the Android Hash Filename
+ 
+```
+openssl x509 -inform PEM -subject_hash_old -in burpca.crt -noout
 ```
 Example output: `9a5ba575` → rename the cert to `9a5ba575.0`
-
-### 7.3 Push and Install
-
+ 
+```
+rename burpca.crt 9a5ba575.0
+```
+(on Linux/macOS use `mv burpca.crt 9a5ba575.0` instead of `rename`)
+ 
+### 7.4 Push and Install
+ 
 ```
 adb push 9a5ba575.0 /sdcard/
 adb shell
@@ -157,9 +170,9 @@ chmod 644 /system/etc/security/cacerts/9a5ba575.0
 chown root:root /system/etc/security/cacerts/9a5ba575.0
 reboot
 ```
-
-### 7.4 Verify
-
+ 
+### 7.5 Verify
+ 
 ```
 adb shell
 su
