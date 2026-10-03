@@ -127,87 +127,23 @@ Expected: `10.0.2.2:4444`
 
 ---
 
-## 7. Install the Burp CA as a System CA
+## 7. Force All App Traffic Through Burp (iptables)
  
-System-level CA installation is required for the proxy to be *trusted*, not just reached. Browser traffic alone being decrypted does not confirm the app will trust the same cert — see §8.
+Even with the proxy set (step 6) and the system CA installed (step 7), **many Flutter apps still won't show up in Burp.** This is because Flutter's networking layer frequently ignores Android's global HTTP proxy setting entirely — that setting was only ever built for apps that check it, and plenty of Flutter apps don't.
  
-### 7.1 Export and Verify the Burp CA
-Burp → Proxy → Proxy settings → Import/Export CA certificate → export as DER.
+The fix is to redirect traffic at the network level instead, so it doesn't matter whether the app checks the proxy setting or not:
  
-```
-openssl x509 -inform DER -in burpca.der -subject -issuer -noout
-```
-Expected: `O=PortSwigger ... CN=PortSwigger CA` on both lines.
- 
-### 7.2 Convert DER → CRT (PEM)
- 
-Compute the Android hash filename from a PEM-format certificate, not directly from the raw DER file — doing it directly from DER is unreliable across OpenSSL versions/builds. Convert first:
- 
-```
-openssl x509 -inform DER -in burpca.der -out burpca.crt
-```
- 
-### 7.3 Compute the Android Hash Filename
- 
-```
-openssl x509 -inform PEM -subject_hash_old -in burpca.crt -noout
-```
-Example output: `9a5ba575` → rename the cert to `9a5ba575.0`
- 
-```
-rename burpca.crt 9a5ba575.0
-```
-(on Linux/macOS use `mv burpca.crt 9a5ba575.0` instead of `rename`)
- 
-### 7.4 Push and Install
- 
-```
-adb push 9a5ba575.0 /sdcard/
-adb shell
-su
-mv /sdcard/9a5ba575.0 /system/etc/security/cacerts/
-chmod 644 /system/etc/security/cacerts/9a5ba575.0
-chown root:root /system/etc/security/cacerts/9a5ba575.0
-reboot
-```
- 
-### 7.5 Verify
- 
-```
-adb shell
-su
-ls -l /system/etc/security/cacerts/9a5ba575.0
-```
-Also check: **Settings → Security → Trusted credentials → System** for the PortSwigger CA entry.
-
----
-
-## 8. Why "Chrome Works, the App Doesn't" — And What Actually Fixes It
-
-This is the single most common point of confusion in Flutter interception, so it gets its own section.
-
-**What's actually happening:**
-1. **Routing problem** — Some Flutter networking paths do not read the Android global HTTP proxy setting at all. Traffic simply never reaches Burp.
-2. **Trust problem** — Even when traffic does reach Burp, some Flutter apps validate the TLS certificate using their own bundled logic/trust material rather than (or in addition to) the Android system trust store that Chrome uses. In that case the handshake fails and nothing usable appears in HTTP History, even though the connection attempt happened.
-3. **Pinning problem** — The app explicitly pins a certificate or public key and rejects anything else, by design.
-
-**Important correction to a common assumption:** it is *not* universally true that all Flutter apps ignore the system CA store — behavior varies by Flutter version, which networking package the app uses (`dart:io` `HttpClient`, `dio`, `cronet`, platform channels to native HTTP clients, etc.), and whether the developer added custom pinning. **Do not assume which of the three problems above you have — test for it directly, in this order:**
-
-### 8.1 Fix Layer 1 — Network-Layer Redirection (solves the routing problem)
-
-Mandatory for this workflow regardless of which app you're testing, because it costs nothing if unneeded and fixes the most common failure:
-
 ```
 adb shell
 su
 iptables -t nat -A OUTPUT -p tcp --dport 443 -j DNAT --to-destination 10.0.2.2:4444
 iptables -t nat -A OUTPUT -p tcp --dport 80  -j DNAT --to-destination 10.0.2.2:4444
 ```
-
-This forces **all** outbound HTTP/HTTPS traffic to Burp at the packet level, independent of whether the app's HTTP client is proxy-aware. It is architecture-independent and works identically on x86_64 and arm64.
-
-> **This rule does not survive a Cold Boot.** A normal Stop/Resume (quick-boot snapshot) preserves it; "Cold Boot Now" resets it and it must be re-added.
-
+ 
+This forces **every** outbound HTTP/HTTPS connection from the emulator to Burp, regardless of which app made it or how its code is written.
+ 
+> **This rule does not survive a Cold Boot.** A normal Stop/Resume of the emulator (quick-boot snapshot) preserves it; "Cold Boot Now" resets it and the two commands above must be re-run.
+ 
 To remove when finished:
 ```
 iptables -t nat -D OUTPUT -p tcp --dport 443 -j DNAT --to-destination 10.0.2.2:4444
@@ -220,122 +156,115 @@ iptables -t nat -D OUTPUT <n>
 # or, nuclear option:
 iptables -t nat -F
 ```
+---
 
-### 8.2 Fix Layer 2 — System CA Trust (solves the trust problem, for apps that honor it)
-
-This is §7 above. **Test empirically**: launch the app, perform a network action, check Burp HTTP History.
-
-- If traffic now appears → you were only missing Layers 1 and/or 2. Done — proceed to testing (§11).
-- If traffic still does not appear, or Burp's **event log/Dashboard** shows TLS handshake failures without a corresponding HTTP History entry → the app likely performs its own certificate validation independent of the system store, or pins. Proceed to Layer 3.
-
-### 8.3 Fix Layer 3 — Runtime Bypass with Frida (solves the trust/pinning problem generically)
-
-This works regardless of *how* the app validates certificates, and regardless of architecture (Frida ships binaries for x86, x86_64, arm, and arm64).
-
+## 8. Install the Burp CA as a System CA
+ 
+System-level CA installation is required for the proxy to be *trusted*, not just reached. Browser traffic alone being decrypted does not confirm the app will trust the same cert — see §8.
+ 
+### 8.1 Export and Verify the Burp CA
+Burp → Proxy → Proxy settings → Import/Export CA certificate → export as DER.
+ 
 ```
-# On the device/emulator (rooted):
-adb push frida-server-<version>-android-<arch> /data/local/tmp/frida-server
+openssl x509 -inform DER -in burpca.der -subject -issuer -noout
+```
+Expected: `O=PortSwigger ... CN=PortSwigger CA` on both lines.
+ 
+### 8.2 Convert DER → CRT (PEM)
+ 
+Compute the Android hash filename from a PEM-format certificate, not directly from the raw DER file — doing it directly from DER is unreliable across OpenSSL versions/builds. Convert first:
+ 
+```
+openssl x509 -inform DER -in burpca.der -out burpca.crt
+```
+ 
+### 8.3 Compute the Android Hash Filename
+ 
+```
+openssl x509 -inform PEM -subject_hash_old -in burpca.crt -noout
+```
+Example output: `9a5ba575` → rename the cert to `9a5ba575.0`
+ 
+```
+rename burpca.crt 9a5ba575.0
+```
+(on Linux/macOS use `mv burpca.crt 9a5ba575.0` instead of `rename`)
+ 
+### 8.4 Push and Install
+ 
+```
+adb push 9a5ba575.0 /sdcard/
 adb shell
 su
-chmod 755 /data/local/tmp/frida-server
-/data/local/tmp/frida-server &
-
-# On the host machine:
-pip install frida-tools
-frida-ps -U        # confirms the host can see the device
-
-# Identify the target package:
-adb shell pm list packages | findstr <part_of_app_name>
-
-# Spawn with a pinning-bypass script:
-frida -U -f <package.name> -l flutter_sslpin_bypass.js --no-pause
+mv /sdcard/9a5ba575.0 /system/etc/security/cacerts/
+chmod 644 /system/etc/security/cacerts/9a5ba575.0
+chown root:root /system/etc/security/cacerts/9a5ba575.0
+reboot
 ```
-
-Notes:
-- The `frida-server` binary version must match your installed `frida-tools`/`frida` Python package version, or the connection will fail silently or with a version-mismatch error.
-- The app must be launched *through* Frida (`-f` spawn mode) each time you want the bypass active — opening it normally from the launcher will not apply the hook.
-- A statically patched engine (reFlutter) and a runtime Frida bypass are **alternatives to each other**, not requirements to stack. If one already works reliably for your target, you don't need the other.
-
-### 8.4 Decision Summary
-
+ 
+### 8.5 Verify
+ 
 ```
-Chrome traffic visible in Burp?
-  NO  → Burp listener/port/firewall misconfigured. Fix §5–6 first.
-  YES → continue
-
-App traffic visible after Layer 1 (iptables) + Layer 2 (system CA)?
-  YES → proceed to testing (§11)
-  NO  → check Burp event log for TLS handshake failures
-          YES (handshake failures logged) → apply Layer 3 (Frida)
-          NO  (nothing logged at all)      → re-check iptables rules are present
-                                              (did a Cold Boot reset them?),
-                                              re-check proxy address value,
-                                              re-check app is actually making
-                                              network calls (not cached/offline)
-```
+adb shell
+su
+ls -l /system/etc/security/cacerts/9a5ba575.0
+```Also check: **Settings → Security → Trusted credentials → System** for the PortSwigger CA entry.
 
 ---
 
-## 9. Real Device Alternative
-
-Useful when: patched-engine architecture availability only covers ARM, or emulator environment issues (Hyper-V conflicts, slow ARM translation) are costing more time than they save.
-
-1. Enable Developer Options (tap Build Number 7×) and USB Debugging.
-   - **Samsung devices:** USB debugging stays grayed out until a screen lock (PIN/Pattern/Password) is set — this is enforced by Samsung, not a bug.
-2. Connect via USB. If the device only shows as charging with no data-transfer popup, check the USB mode (notification → File Transfer/MTP/PTP, not "Charging only"), try a different cable (many are charge-only), and try a direct port rather than a hub.
-3. `adb devices` should show the device as `device` (not `unauthorized` — accept the RSA fingerprint popup on the phone, ideally with "always allow").
-4. Root is **not guaranteed** on consumer devices — many modern phones cannot be rooted without an unlocked bootloader and custom recovery, which is a much bigger undertaking and higher risk to the device. If root isn't available, you're limited to:
-   - User-level CA install (Settings → Security → Install a certificate) — works for apps that defer to the system/user trust store, but **as of Android 7+, apps must explicitly opt in via network security config to trust user certs**; many apps do not, which is a separate reason traffic may not decrypt even without "real" pinning.
-   - Frida, **if** the device is rooted or you use Frida Gadget (an SDK injected into a repackaged APK) as a no-root alternative.
-5. Set phone and laptop on the same Wi-Fi, configure manual proxy to the laptop's LAN IP:port, and allow the port through Windows Firewall.
-
----
-
-## 10. Genymotion Alternative — Known Pitfalls
-
-Genymotion is attractive because it's rooted out of the box, but on Windows hosts it frequently collides with **Hyper-V** (which Windows enables implicitly for WSL2, Docker Desktop, Windows Hypervisor Platform, or Device Guard/Credential Guard).
-
-Symptoms of this conflict:
-- "The virtual device did not get any IP address" / DHCP server errors on first boot
-- Device freezes at boot or shows "System UI isn't responding"
-- `player.exe is not responding` dialogs
-
-Mitigations, in order of least disruptive first:
-1. Set the VM's network mode to **NAT** rather than Bridged, especially if your host's primary adapter is Wi-Fi (bridging frequently fails on Wi-Fi adapters regardless of Hyper-V).
-2. Increase allocated RAM (≥4GB) and CPU cores (2–4) in VirtualBox VM settings, and confirm VT-x/AMD-V + Nested Paging are enabled there.
-3. If Genymotion/VirtualBox explicitly reports "Hyper-V detected — falls back on software emulation," you have two real options: disable Hyper-V/WSL2/Windows Hypervisor Platform (Windows Features) and reboot — **but this will likely break Android Studio's own AVD acceleration**, which also depends on Windows's hypervisor layer — or accept Genymotion will run in slow software-emulation mode.
-4. Given the trade-off in point 3, if you already have a working Android Studio AVD path, it is often faster to continue with that rather than resolve the Hyper-V conflict.
-
-Genymotion's host-to-guest address for proxy configuration is typically **`10.0.3.2`**, not `10.0.2.2`.
-
----
-
-## 11. Flutter Application Interception Test
-
-1. Launch the application (normally, or via `frida -U -f <package> -l script.js --no-pause` if using runtime bypass).
-2. Perform a network action: login, OTP request, search, refresh, open an API-backed screen, submit a form.
+## 9. Flutter Application Interception Test
+ 
+1. Install the target app on the emulator (`adb install your-app.apk`).
+2. Launch the application and perform a network action: login, OTP request, search, refresh, open an API-backed screen, submit a form.
 3. Check **Burp → Proxy → HTTP History**.
-
 **Expected result:** the application's HTTP/HTTPS requests appear in HTTP History.
-
-If traffic is absent, work through §8.4's decision tree rather than assuming SSL pinning — **no traffic in Burp is not, by itself, evidence of pinning.** It is equally or more often a routing or environment misconfiguration.
-
+ 
+If traffic is still absent after steps 6–8, don't immediately assume SSL pinning — re-check the proxy address (§6), confirm the CA actually installed (§7.6), and confirm the iptables rules are still present (§8, especially after a Cold Boot). Only once all of that checks out should you move on to §11.
+ 
 ---
-
-## 12. Static Indicators of Certificate Pinning (for code/binary review)
-
+ 
+## 10. Static Indicators of Certificate Pinning (for code/binary review)
+ 
 - `CertificatePinner` (OkHttp)
 - `X509TrustManager` / `checkServerTrusted` custom implementations
 - Custom `HostnameVerifier`
 - Custom `SSLSocketFactory`
 - Custom certificate validation logic
 - Native/engine-level TLS implementation (BoringSSL calls inside `libflutter.so` or a custom native library)
-
 Generic presence of OkHttp or standard Android framework TLS classes, by itself, is **not** proof of pinning — look for the custom logic specifically.
+ 
+---
+ 
+## 11. If It Still Doesn't Work: Runtime Bypass with Frida
+ 
+If steps 6–9 are all correctly configured and the target app's traffic *still* never appears (or Burp's event log shows TLS handshake failures), the app likely performs its own certificate validation on top of — or instead of — the system trust store.
+ 
+```
+# On the emulator (rooted):
+adb push frida-server-<version>-android-x86_64 /data/local/tmp/frida-server
+adb shell
+su
+chmod 755 /data/local/tmp/frida-server
+/data/local/tmp/frida-server &
+ 
+# On the host machine:
+pip install frida-tools
+frida-ps -U        # confirms the host can see the device
+ 
+# Identify the target package:
+adb shell pm list packages | findstr <part_of_app_name>
+ 
+# Spawn with a pinning-bypass script:
+frida -U -f <package.name> -l flutter_sslpin_bypass.js --no-pause
+```
+ 
+Notes:
+- The `frida-server` binary version must match your installed `frida-tools`/`frida` Python package version, or the connection will fail silently or with a version-mismatch error.
+- The app must be launched *through* Frida (`-f` spawn mode) each time you want the bypass active — opening it normally from the launcher will not apply the hook.
 
 ---
 
-## 13. Troubleshooting Matrix
+## 12. Troubleshooting Matrix
 
 | Problem | Likely Cause | Action |
 |---|---|---|
@@ -352,7 +281,7 @@ Generic presence of OkHttp or standard Android framework TLS classes, by itself,
 
 ---
 
-## 14. Command Cheat Sheet
+## 13. Command Cheat Sheet
 
 ```bash
 # AVD
@@ -397,7 +326,7 @@ frida -U -f <package.name> -l flutter_sslpin_bypass.js --no-pause
 
 ---
 
-## 15. Complete Workflow — Quick View
+## 14. Complete Workflow — Quick View
 
 ```
 Choose environment (Android Studio Google APIs AVD recommended first)
@@ -428,7 +357,7 @@ Remove iptables rule when finished (§8.1 cleanup)
 
 ---
 
-## 16. Final Testing Principle
+## 15. Final Testing Principle
 
 Build confidence in layers rather than assuming failure means pinning:
 
